@@ -1,0 +1,546 @@
+---
+title: "ML1 big dataset - regression"
+author: Paulina Żabska & Rafał Łobacz
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+<style>
+body {
+text-align: justify}
+</style>
+
+
+# Introduction
+
+In this project we will try to predict Warsaw real estate prices. Data that we use comes from github user [link](https://github.com/Jan-Majewski/Project_Portfolio/blob/master/03_Real_Estate_pricing_in_Warsaw/RE_models_input_enriched.xlsx) and include real webscraped data. It is quite big - 25240 rows x 75 columns. We will use RMSE as metric to compare models. There will be 8 models. Including some simple like linear regression or k-nearest neighbors. But we also use some newer tree based approaches like xgboost. Our goal is to get intuition which type is better. Dependent variable is very Price and describes price of real estate. Because it`s distribution is very skewed we are going to model log transformation of this variable.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo    = TRUE, 
+                      cache   = TRUE,
+                      message = FALSE, 
+                      warning = FALSE)
+options(scipen = 10)
+```
+
+# Data preparation
+
+Reading libraries
+```{r}
+library(tidyverse)
+library(car)
+library(pROC)
+library(lmtest)
+library(caret)
+library(DMwR)
+library(ranger)
+library(corrplot)
+library(DT)
+```
+
+Reading data and printing 20 observations. 
+```{r}
+df <- readxl::read_xlsx('RE_models_input_enriched.xlsx')
+DT::datatable(head(df,20),extensions = 'FixedColumns',options = list(
+  scrollX = TRUE))
+```
+
+Data have 75 columns, at the first look we can spot that some of them are transformations of another. We need to tidy the data. Firstly we are going to look at depended variable - Price. It might require log transformation as Price variables are usually skewed. Let`s make histogram of Price.
+
+```{r}
+ggplot(df,
+       aes(x = Price)) +
+  geom_histogram(fill = "pink",
+                 col='grey',
+                 bins = 100) + ggtitle('Price distribution')  +
+  theme_bw()
+```
+
+We can see that it is skewed. There is fat tail. It is not a surprise, there are probably some expensive apartments. Let`s plot histogram of log transformation.
+
+```{r}
+ggplot(df,
+       aes(x = log(Price))) +
+  geom_histogram(fill = "pink",
+                 col='grey',
+                 bins = 100) + ggtitle('log(Price) distribution')  +
+  theme_bw()
+#transforming Price to log
+df$Price <- log(df$Price)
+```
+
+Now it looks much better. We are going to model this in log transformed version. Normally such things should be done on train splitted sample, but log transformation does not cause data leakage and skewed Price variable is common thing, so we did it at beginning.\
+Next we are going to look closer at character variables. Let`s print their length.
+
+```{r}
+df_character_vars <- 
+  sapply(df, is.character) %>% 
+  which() %>% 
+  names()
+sapply(df[, df_character_vars], 
+        function(x) 
+          unique(x) %>% 
+          length()) %>% 
+  sort()
+```
+
+There are some suspicious results. We will immediately delete City it only has 1 value. Let`s look closer at other.
+
+```{r}
+table(df$offer_date)
+```
+
+It looks like ther are two dates. We will delete this variable. This does not tell us to much. Probably they are just dates that data were scraped.
+
+```{r}
+table(df$market)
+```
+
+Market variable look ok.
+
+```{r}
+table(df$Construction_status)
+```
+
+Market variable look ok.
+
+```{r}
+table(df$Windows_type)
+```
+
+Windows_type variable look quite ok.
+
+```{r}
+table(df$Heating)
+df$Heating[df$Heating=='tiled_stove'] <- 'not_specified'
+```
+
+In heating there is tiled_stove with only 1 instance. We will merge it to other.
+
+```{r}
+table(df$Building_type)
+#merging levels
+df$Building_type[df$Building_type=='loft'] <- 'not_specified'
+df$Building_type[df$Building_type=='detached'] <- 'not_specified'
+df$Building_type[df$Building_type=='infill'] <- 'not_specified'
+```
+
+In Building_type there are 3 levels that should be merged. Loft, detached and infill will be changed to not_specified.
+
+```{r}
+table(df$rooms_num)
+#merging levels
+df$rooms_num[df$rooms_num %in% c('7','8','9','more','10')] <- '7+'
+```
+
+In rooms_num everything greater than 7 will be moved to 7+ category.
+
+```{r}
+table(df$Building_material)
+#merging hydroton and wood to other
+df$Building_material[df$Building_material %in% c('hydroton','wood')] <- 'other'
+```
+
+In Building_material hydroton and wood will be moved to other.
+
+```{r}
+table(df$floor_no)
+#merging garret and cellar to not_specified
+df$floor_no[df$floor_no %in% c('garret','cellar')] <- 'not_specified'
+```
+
+In floor_no cellar and garret will be moved to not_specified.\
+There are also 3 other variables:district_old, district and subdistrict. We will delete subdistrict as it has to much categories. District and district_old is pretty much the same variable. We will also delete dictrict_old. We will delete variable that we mention at the end of data preparation\
+Now we are going to transform all those characters to factor. Next we will check how many unique values are in numeric variables.
+
+```{r }
+#changing character variables to factor type
+df[df_character_vars] <- lapply(df[df_character_vars] , factor)
+
+df_numeric_vars <- 
+  sapply(df, is.numeric) %>% 
+  which() %>% 
+  names()
+#checking number of unique observations
+numeric_unique <- sapply(df[, df_numeric_vars], 
+        function(x) 
+          unique(x) %>% 
+          length()) %>% 
+  sort() %>% as.data.frame()
+datatable(numeric_unique)
+
+```
+
+We can see that there are many variables with only 2 unique observations. They are probably some dummy variables and should be transformed to factors. Next we will check which of the numeric variables have potentially 0 variance.
+```{r}
+#changing columns from equipment to security to factors
+to_fac <- df %>% 
+  select(Equipment_types_dishwasher:Security_types_roller_shutters) %>%
+  colnames()
+df[to_fac] <- lapply(df[to_fac] , factor)
+zero_names <- df[, df_numeric_vars] %>% 
+          nearZeroVar(names=TRUE)
+zero_names
+```
+
+9 of them are suspicious. Let`s check their distribution. We are going to delete only those that are highly unbalanced.
+
+```{r}
+foo_table <- table(df[,zero_names[1]])
+for (name in zero_names[-1]){
+  foo_table <- rbind(foo_table,table(df[,name]))
+}
+rownames(foo_table) <- zero_names
+foo_table %>%
+  kableExtra::kbl() %>%
+  kableExtra::kable_classic("striped", full_width = F)
+```
+
+In the table above we can see their distribution. We are going to delete those that have only 1 or 2 observations in '1' column. So we will delete 5 of those variables. They will be totally irrelevant in modeling. 
+
+```{r}
+#Deleting all variables that I mentioned
+#this variable got ' in name i can`t delet it automatically, so I used some workaround
+df$Media_types_cable_television <- df$`Media_types_cable-television`
+#defining variable with names
+drops <- c("City","offer_date",'subdistrict','Extras_types_attic','Media_types_cable_television','Media_types_electricity','Media_types_sewage','Media_types_water','unit_price','floor_num',"Id",'Media_types_cable-television')
+#filtering data 
+df <- df[ , !(names(df) %in% drops)]
+ncol(df)
+```
+
+At the end I`m going to partition the data to 80% train and 20% test.
+
+```{r}
+set.seed(987654321)
+#splitting the data 
+data_which_train <- createDataPartition(df$Price, # target variable
+                                          # share of the training sample
+                                          p = 0.8, 
+                                          # should result be a list?
+                                          list = FALSE)
+#filtering to train
+df_train <- df[data_which_train,]
+#filtering to test
+df_test <- df[-data_which_train,]
+#summarising train and test to compare
+matrix_compare <- rbind(summary(df_train$Price),summary(df_test$Price))
+rownames(matrix_compare) <- c('train','test')
+matrix_compare %>%
+  kableExtra::kbl() %>%
+  kableExtra::kable_classic("striped", full_width = F)
+
+
+```
+
+
+# Feature Selection & data transformation
+
+Now we are going to check if the numeric variables are correlated. If yes we will delete them. We will keep those which sound more natural and have higher correlation with Price. Also we will delete only those that show very high correlation.
+
+```{r}
+#selecting names of numeric variables
+train_numeric_vars <- 
+  # check if variable is numeric
+  sapply(df_train, is.numeric) %>% 
+  # select those which are
+  which() %>% 
+  # and keep just their names
+  names()
+train_numeric_vars
+```
+
+We can see that there are 27 numeric variables. We will plot two correlograms, for the first part and of the second part.
+
+```{r}
+#counting correlations
+train_correlations <- 
+    cor(df_train[,train_numeric_vars],
+        use = "pairwise.complete.obs")
+#ordering from +1 to -1
+train_numeric_vars_order <- 
+  # we take correlations with the Sale_Price
+  train_correlations[,"Price"] %>% 
+  # sort them in the decreasing order
+  sort(decreasing = TRUE) %>%
+  # end extract just variables' names
+  names()
+corrplot.mixed(train_correlations[train_numeric_vars_order[1:15], 
+                                   train_numeric_vars_order[1:15]],
+               upper = "square",
+               lower = "number",
+               tl.col="black", # color of labels (variable names)
+               tl.pos = "lt")
+```
+
+Looking at correlogram of first part we can see that lon_mod is very highly correlated with longitude. We will delete lon_mod, as longitude sounds and looks more natural. Also, restaurant_rating_count will be deleted, as this variable is highly correlated with restaurant count that is a little more correlated with Price. All other variables look ok.\
+Now we will draw correlation plot of second part.
+
+```{r}
+corrplot.mixed(train_correlations[train_numeric_vars_order[c(1,15:27)], 
+                                   train_numeric_vars_order[c(1,15:27)]],
+               upper = "square",
+               lower = "number",
+               tl.col="black", # color of labels (variable names)
+               tl.pos = "lt")
+```
+
+We can see that much more variables are correlated with each other. We will delete lat_mod, geo_Id and index that are correlated with latitude. Moreover, there is group of variables named 'time_...' and 'distance_...' that are highly correlated. We will leave only one of them - distance_transit_8AM, as this variable has the biggest correlation with Price, also most of the people use transit and are interested how fast they can travel to work at the morning. Time variables are derived from distance. It makes more sense to keep distance.\
+Furthermore, there might be some data leakage here. As there were no description what each variable means, we can only make selection based on pure statistical analysis. For example price_decrease_from_20k sounds suspicious.
+
+```{r}
+train_drops <- c('lon_mod','lat_mod','restaurant_ratings_count','geo_Id',
+                 'time_driving_8AM','time_return_driving_5PM',
+                 "time_return_transit_5PM",'time_transit_8AM',
+                 'distance_return_driving_5PM','distance_driving_8AM',
+                 'district_old','distance_return_transit_5PM','index')
+df_train <- df_train[ , !(names(df_train) %in% train_drops)]
+```
+
+Last step is to choose final variables for model with Random Forest variable importance.
+
+```{r}
+options("scipen"=100, "digits"=4)
+
+#Fitting Random Forest to train data
+set.seed(987654321)
+ranger_model <- ranger::ranger(Price~.,df_train, importance = "impurity_corrected")
+#printing variable importance
+imp_vars <- importance(ranger_model) %>% 
+  data.frame() %>% arrange(desc(.)) 
+imp_vars %>%
+  kableExtra::kbl() %>%
+  kableExtra::kable_classic("striped", full_width = F) %>% 
+  kableExtra::scroll_box(height = "400px") 
+```
+
+We decided that we will keep only 20 variables with biggest importance.
+
+```{r}
+df_train <- df_train %>% select(rownames(imp_vars)[1:20],Price)
+df_test <- df_test %>% select(rownames(imp_vars)[1:20],Price)
+rm(ranger_model)
+```
+
+
+# Train
+
+Having everything prepared we will now train 8 models. Process of training is pretty much the same for all of them. We use caret train function and appropriate method name. Some of them might include tuning parameters. We are going to make comments only to the first method what each line of code do. We will use 5-Fold Cross-Validation.
+
+```{r}
+options(contrasts = c("contr.treatment",  # for non-ordinal factors
+                      "contr.treatment")) # for ordinal factors
+ctrl_cv5 <- trainControl(method = "cv",
+                          number=5,
+                         allowParallel=TRUE)
+```
+
+
+```{r }
+#fitting logit
+set.seed(987654321)
+lm_model <- train(Price ~ ., 
+        data = df_train,
+        method = "lm",
+        trControl = ctrl_cv5,
+        metric='RMSE')
+
+#predicting train data from model obtained from cross-validation logit
+train_lm = predict(lm_model)
+#Counting RMSE
+train_lm_acc = RMSE(train_lm,df_train$Price)
+#predicting test data
+test_lm = predict(lm_model,df_test)
+#Counting RMSE
+test_lm_acc = RMSE(test_lm,df_test$Price)
+#storing cross-validation RMSE
+vec_valid <- mean(lm_model$resample[,"RMSE"])
+#storing train prediction RMSE
+vec_train <- train_lm_acc
+#storing test prediction RMSE
+vec_test <- test_lm_acc
+
+#everything below follows the same procedure so I`m not gonna comment every model
+#only difference could be some additional parameters tuning
+
+#KNN
+set.seed(987654321)
+different_k <- data.frame(k = c(3))
+knn_model <- 
+  train(Price ~ ., 
+        data = df_train ,
+        method = "knn",
+        trControl = ctrl_cv5,
+        tuneGrid = different_k,
+        preProcess = c("range"),
+        #preProcess = c("center","scale"),
+        metric='RMSE')
+
+train_knn = predict(knn_model)
+train_knn_acc =  RMSE(train_knn,df_train$Price)
+test_knn = predict(knn_model,df_test)
+test_knn_acc = RMSE(test_knn,df_test$Price)
+vec_valid <- rbind(vec_valid,mean(knn_model$resample$RMSE))
+vec_train <- rbind(vec_train,train_knn_acc)
+vec_test <- rbind(vec_test,test_knn_acc)
+
+#Random Forest
+tgrid <- expand.grid(
+  .mtry = 15,
+  .splitrule = "variance",
+  .min.node.size = 2
+) 
+set.seed(987654321)
+rf_gridsearch <- train(Price ~ ., 
+                       data = df_train,
+                       method = 'ranger',
+                       metric = 'RMSE',
+                       tuneGrid = tgrid,
+                       trControl = ctrl_cv5,
+                       verbose=TRUE)
+
+train_rf= predict(rf_gridsearch)
+train_rf_acc = RMSE(train_rf,df_train$Price)
+test_rf = predict(rf_gridsearch,df_test)
+test_rf_acc = RMSE(test_rf,df_test$Price)
+vec_valid <- rbind(vec_valid,mean(rf_gridsearch$resample$RMSE))
+vec_train <- rbind(vec_train,train_rf_acc)
+vec_test <- rbind(vec_test,test_rf_acc)
+
+#Extreme Gradient Boosting
+set.seed(987654321)
+tune_grid <- expand.grid(nrounds = 200,
+                        max_depth = 4,
+                        eta = 0.05,
+                        gamma = 0,
+                        colsample_bytree = 0.5,
+                        min_child_weight = 0,
+                        subsample = 0.5)
+
+xgb_fit <- train(Price ~., data = df_train, method = "xgbTree",
+                trControl=ctrl_cv5,
+                tuneGrid = tune_grid,
+                tuneLength = 10,
+                objective = "reg:squarederror")
+train_xgb= predict(xgb_fit)
+train_xgb_acc = RMSE(train_xgb,df_train$Price)
+test_xgb = predict(xgb_fit,df_test)
+test_xgb_acc = RMSE(test_xgb,df_test$Price)
+vec_valid <- rbind(vec_valid,mean(xgb_fit$resample$RMSE))
+vec_train <- rbind(vec_train,train_xgb_acc)
+vec_test <- rbind(vec_test,test_xgb_acc)
+
+
+#Neural Network
+set.seed(987654321)
+nnet_fit <- train(Price ~., data = df_train, method = "nnet",
+                trControl=ctrl_cv5,
+                 maxit=1000,
+                preProcess = c('center', 'scale'),
+                metric='RMSE', 
+                trace=FALSE,
+                linout=TRUE,
+                tuneGrid=expand.grid(size=c(5), decay=c(0.1)))
+train_nn= predict(nnet_fit)
+train_nn_acc = RMSE(train_nn,df_train$Price)
+test_nn = predict(nnet_fit,df_test)
+test_nn_acc = RMSE(test_nn,df_test$Price)
+vec_valid <- rbind(vec_valid,mean(nnet_fit$resample$RMSE))
+vec_train <- rbind(vec_train,train_nn_acc)
+vec_test <- rbind(vec_test,test_nn_acc)
+
+#Elastic net
+set.seed(987654321)
+parameters_elastic2 <- expand.grid(alpha = seq(0, 1, 0.1), 
+                                   lambda = seq(0.01, 0.4, 0.01))
+
+glm_fit <- train(Price ~., data = df_train, method = "glmnet",
+                trControl=ctrl_cv5,
+                metric='RMSE',
+                tuneGrid = parameters_elastic2
+                )
+train_glm= predict(glm_fit)
+train_glm_acc = RMSE(train_glm,df_train$Price)
+test_glm = predict(glm_fit,df_test)
+test_glm_acc = RMSE(test_glm,df_test$Price)
+vec_valid <- rbind(vec_valid,mean(glm_fit$resample$RMSE))
+vec_train <- rbind(vec_train,train_glm_acc)
+vec_test <- rbind(vec_test,test_glm_acc)
+
+#Gradient Boosting
+set.seed(987654321)
+parameters_gbm<- expand.grid(interaction.depth=c(4),
+                             n.trees=c(250),
+                             shrinkage=0.1,
+                             n.minobsinnode=10)
+gbm_fit <- train(Price ~ ., data = df_train, 
+                 method = "gbm",
+                 metric='RMSE',
+                 trControl = ctrl_cv5, 
+                 tuneGrid = parameters_gbm,
+                 verbose = FALSE)
+train_gbm= predict(gbm_fit)
+train_gbm_acc = RMSE(train_gbm,df_train$Price)
+test_gbm = predict(gbm_fit,df_test)
+test_gbm_acc = RMSE(test_gbm,df_test$Price)
+vec_valid <- rbind(vec_valid,mean(gbm_fit$resample$RMSE))
+vec_train <- rbind(vec_train,train_gbm_acc)
+vec_test <- rbind(vec_test,test_gbm_acc)
+
+#Partial Least Squared
+set.seed(987654321)
+pls_fit <- train(Price ~ ., data = df_train, 
+                 method = "pls",
+                 metric='RMSE',
+                 preProc = c("center", "scale"),
+                 tuneLength = 10,
+                 maxit=1000,
+                 trControl = ctrl_cv5)
+train_pls= predict(pls_fit)
+train_pls_acc = RMSE(train_pls,df_train$Price)
+test_pls = predict(pls_fit,df_test)
+test_pls_acc = RMSE(test_pls,df_test$Price)
+vec_valid <- rbind(vec_valid,mean(pls_fit$resample$RMSE))
+vec_train <- rbind(vec_train,train_pls_acc)
+vec_test <- rbind(vec_test,test_pls_acc)
+```
+
+After all models are trained we are going to create matrix of results.
+```{r}
+#column binding train prediction,cross-validation and test prediction results
+df_results <- cbind(vec_train,vec_valid,vec_test)
+#changing rownames
+rownames(df_results) <- c('lm','knn','rf', 'xgb','nnet','elastic',
+                          'gbm','pls')
+#changing colnames
+colnames(df_results) <- c('train','cross_validation','test')
+
+```
+
+On the plot below we can see cross-validation results. Firstly we can spot that KNN is the worst model, RMSE equal to 0.278 is far worse than other methods. Next we have three models that have very similar performance. In this group there is eslastic net, lingear regression and partial least squared. It is not a surprise they all share similar concept. Their RMSE is equal to 0.191. Next we have neural network that has lower RMSE than those methods - 0.154. XGboost and GBM have a little bit better performance than neural network, RMSE - 0.145. The best method is Random Forest with RMSE equal to 0.130.
+
+```{r}
+#storing list of resamples to make dotplot of cross-validation AUCROC results 
+cvValues <- resamples(list(elastic = glm_fit,nn=nnet_fit,
+                           xgb=xgb_fit,
+                           lm=lm_model,rf=rf_gridsearch,
+                           gbm=gbm_fit,pls=pls_fit,knn=knn_model))
+#ploting results of models cross-validation results
+dotplot(cvValues, metric = "RMSE", main = 'Cross-validation results')
+```
+
+Now let`s check how the models predict out of sample data. As we can see in the table all the models have better performance on test data. There could be some extreme, unusual observations in train data. KNN is still the worst. For lm, elastic and pls test RMSE is equal to 0.187. Neural network RMSE is the same on test data, same for gbm and xgb. Random Forest RMSE is equal to 0.128 and is even better than cross-validation.
+
+```{r}
+#printing table of train/cross-validation/test results
+df_results %>% as.data.frame() %>% arrange(cross_validation) %>%
+  kableExtra::kbl(digits = 3,caption = 'RMSE') %>%
+  kableExtra::kable_classic("striped", full_width = F)
+```
+
+# Summary
+
+To sum up we can see that tree based models are the best, especially Random Forest. They could easily detect nonlinearities and their performance is way better than standard methods like linear regression. Neural Network looks also promising on this dataset. Maybe with more iterations and better tuning it could overcome tree based methods. Moreover, using explainable artificial intelligence could be interesting here, checking why Random Forest did better than gradient boosting methods.\
+We were not pleased that there were no description of variables. Having more knowledge could lead us to better data preparation and selection. Preparing and tidying the data took us the biggest part of the time in this project. We think that it is crucial in modelling.

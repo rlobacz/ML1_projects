@@ -1,0 +1,465 @@
+---
+title: "ML1 small dataset - classification"
+author: Paulina Żabska & Rafał Łobacz
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction
+
+In this project we will try to predict stroke occurrence. Data that we use comes from kaggle repository [link](https://www.kaggle.com/fedesoriano/stroke-prediction-dataset) and include personal information about patients. It is relatively small - 5110 rows x 12 columns. We will use AUCROC as metric to compare models. There will be 11 models. Including some simple like logistic regression, k-nearest neighbours or linear discriminant analysis. But we also use some newer tree based approches like xgboost. Our goal is to get intuition which type is better. Dependent variable is very unbalanced, so we used SMOTE.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo    = TRUE, 
+                      cache   = TRUE,
+                      message = FALSE, 
+                      warning = FALSE)
+options(scipen = 10)
+```
+
+# Data preparation
+
+Reading libraries
+```{r}
+library(tidyverse)
+library(car)
+library(pROC)
+library(lmtest)
+library(caret)
+library(DMwR)
+library(randomForest)
+library(pROC)
+
+```
+
+Reading data and checking glimpse of variables. 
+```{r}
+df <- read.csv('healthcare-dataset-stroke-data.csv')
+glimpse(df)
+```
+
+Data have 12 columns, many of them have not appropriate data type. Firstly we will delete id variable as this has no meaning. It is just a unique label of observations. Then we will transform bmi from chr to numeric and next we check missings.
+
+```{r}
+#deleting id column
+df <- df[,-1]
+#changing bmi into numeric 
+df$bmi <- as.numeric(df$bmi)
+#counting column missings
+colSums(is.na(df)) %>% 
+  sort()
+```
+
+There are some missings in bmi. We decided to perform discretization. We can divide people into normal, obese and underweight. We got thresholds from wikipedia page about bmi. Moreover we will add extra level depicting missings. 
+
+```{r}
+#bmi sicretizition
+#making foo variable
+foo_bmi <- ifelse(df$bmi<18.5,"underweight",ifelse(df$bmi<30,"normal","obesity"))
+foo_bmi <- ifelse(is.na(foo_bmi),"missing",foo_bmi)
+df$bmi <- foo_bmi
+#changing to factor
+df$bmi <- as.factor(df$bmi)
+#changing reference level to normal
+df$bmi <- relevel(df$bmi,ref='normal')
+table(df$bmi)
+
+```
+
+Next we will check number of unique levels in each variable.
+```{r}
+sapply(df, 
+        function(x) 
+          unique(x) %>% 
+          length()) %>% 
+  sort()
+```
+
+Let`s check if any variable have 0 variance.
+```{r}
+df %>% select(-stroke) %>% nearZeroVar()
+```
+
+We can see that all variables should have some discriminator power. Now we will transform every variable with 2 levels to factors.
+
+```{r}
+#transforming 4 variables to factors
+df$hypertension <- as.factor(df$hypertension)
+df$heart_disease <- as.factor(df$heart_disease)
+df$ever_married <- factor(as.factor(df$ever_married),labels = c(0,1))
+df$Residence_type <- as.factor(df$Residence_type)
+```
+
+In gender there is 1 Other observation. We will change it to Female as there are more females in data.
+```{r}
+table(df$gender)
+#chaning other to female
+df$gender[which(df$gender=='Other')] <- 'Female'
+#making variable factor
+df$gender <- factor(df$gender,labels = c(0,1))
+```
+
+Work type variable have 5 levels. One of them - never_worked occur only 22 times.
+```{r}
+table(df$work_type)
+```
+
+When we check those observations we can see that they are teenagers, mostly younger than 18 y.o. We decided to merge Never_worked into children.
+```{r}
+#checking who is never_worked
+df[df$work_type=='Never_worked',c('gender','age')]
+#changing never_worked to children
+df[df$work_type=='Never_worked','work_type'] <- 'children'
+df$work_type <- as.factor(df$work_type)
+df$work_type <- relevel(df$work_type,ref='Private')
+```
+
+Smoking status has 4 levels. They all have some sufficient number of occurance. Hence we will not change anything.
+```{r}
+table(df$smoking_status)
+df$smoking_status <- as.factor(df$smoking_status)
+df$smoking_status <- relevel(df$smoking_status,ref='never smoked')
+```
+
+Dependent variable is very unbalanced. We will use SMOTE in training.
+```{r}
+table(df$stroke)
+df$stroke <- factor(ifelse(df$stroke==1,"YES","NO"))
+glimpse(df)
+```
+  
+As our data is ready to use, we will partition it into 70% train and 30% test.
+```{r}
+set.seed(987654321)
+#splitting data
+data_which_train <- createDataPartition(df$stroke, # target variable
+                                          # share of the training sample
+                                          p = 0.7, 
+                                          # should result be a list?
+                                          list = FALSE)
+df_train <- df[data_which_train,]
+df_test <- df[-data_which_train,]
+summary(df_train$stroke)
+summary(df_test$stroke)
+
+```
+
+# Feature Selection & data transformation
+
+Firstly we will plot histogram of numeric variable, maybe there are some outilers or they need transformation.
+```{r fig.align="center"}
+#creating histograms; saving them and ploting in grid
+p1 <- ggplot(df_train,aes(avg_glucose_level)) + 
+  geom_histogram(aes(y=..density..),fill='pink',col='black',alpha=0.3, position="identity")   + theme_bw()
+p2 <-ggplot(df_train,aes(age)) + 
+  geom_histogram(aes(y=..density..),fill='pink',col='black',alpha=0.3, position="identity")   + theme_bw()
+gridExtra::grid.arrange(p1,p2)
+```
+
+We can see that there are no outliers and data transformation would not help us to get normal distributions.\
+When it comes to variable selection we used random forest variable importance with gini statistic. We set 5% threshold for each variable. It is quite liberal because we have only 12 variables.
+
+```{r}
+set.seed(987654321)
+#fitting random forest on train data
+rf_model <- randomForest(stroke~.,df_train)
+#checking variable improtance using GINI
+importance(rf_model) %>% 
+  data.frame() %>% arrange(desc(MeanDecreaseGini))
+
+```
+
+We can see that each variable has greater gini level than 5%, so we will use all variables.\
+Now we are going to use SMOTE to create balanced data. On SMOTE transformed data we will train our models. We know that this is not the best way to do it. SMOTE should be used inside train function. We prepared classification project before our last classes about data sampling and we did not know it. Changing this part would probably lead to new parameters tuning and it would take us some time that is in shortage before exam session. Hope You take this disclaimer into consideration and grade us kindly.
+
+```{r}
+set.seed(987654321)
+#using SMOTE on train data
+df_smote <- SMOTE(stroke ~ ., df_train)
+table(df_smote$stroke)
+```
+Data is not perfectly balanced but we wanted too avoid issues with to much upsampling or to much downsampling.\
+For training we will use 5-Fold Cross Validation 3 times.
+```{r}
+options(contrasts = c("contr.treatment",  # for non-ordinal factors
+                      "contr.treatment")) # for ordinal factors
+#setting up cross-validation 
+ctrl_cv5x3 <- trainControl(method = "repeatedcv",
+                           number = 5,
+                           repeats = 3,
+                         classProbs = TRUE,
+                        summaryFunction = twoClassSummary)
+```
+
+# Training
+
+We are going to train 11 models. Process of training is pretty much the same for all of them. We use caret train function and appropriate method name. Some of them might include tuning parameters. We are going to make comments only to the first method what each line of code do.
+
+```{r }
+#fitting logit
+set.seed(987654321)
+log_model <- train(stroke ~ ., 
+        data = df_smote,
+        method = "glm",
+        family = "binomial",
+        trControl = ctrl_cv5x3,
+        metric='ROC')
+
+#predicting train data from model obtained from cross-validation logit
+train_log = predict(log_model,type = "prob")
+#counting AUCROC
+train_log_roc = roc(df_smote$stroke ~ train_log[,2], plot = FALSE, print.auc = FALSE)
+#predicting test data
+test_log = predict(log_model,df_test,type = "prob")
+#counting AUCROC
+test_log_roc = roc(df_test$stroke ~ test_log[,2], plot = FALSE, print.auc = FALSE)
+#storing cross-validation AUCROC
+vec_valid <- mean(log_model$resample$ROC)
+#storing train prediction AUCROC
+vec_train <- train_log_roc$auc
+#storing test prediction AUCROC
+vec_test <- test_log_roc$auc
+
+#everything below follows the same procedure so I`m not gonna comment every model
+#only difference could be some additional parameters tuning
+
+#k-nearest neighbors 
+set.seed(987654321)
+different_k <- data.frame(k = 117)
+knn_model <- 
+  train(stroke ~ ., 
+        data = df_smote,
+        method = "knn",
+        trControl = ctrl_cv5x3,
+        tuneGrid = different_k,
+        preProcess = c("range"),
+        #preProcess = c("center","scale"),
+        metric='ROC')
+
+train_knn = predict(knn_model,type = "prob")
+train_knn_roc = roc(df_smote$stroke ~ train_knn[,2], plot = FALSE, print.auc = FALSE)
+test_knn = predict(knn_model,df_test,type = "prob")
+test_knn_roc = roc(df_test$stroke ~ test_knn[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(knn_model$resample$ROC))
+vec_train <- rbind(vec_train,train_knn_roc$auc)
+vec_test <- rbind(vec_test,test_knn_roc$auc)
+
+#SVM
+set.seed(987654321)
+parametersC <- data.frame(C = 0.1)
+svm_model <- train(stroke~., 
+                           data = df_smote, 
+                           method = "svmLinear",
+                           metric = 'ROC',
+                           tuneGrid = parametersC,
+                           trControl = ctrl_cv5x3)
+
+train_svm = predict(svm_model,type = "prob")
+train_svm_roc = roc(df_smote$stroke ~ train_svm[,2], plot = FALSE, print.auc = FALSE)
+test_svm = predict(svm_model,df_test,type = "prob")
+test_svm_roc = roc(df_test$stroke ~ test_svm[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(svm_model$resample$ROC))
+vec_train <- rbind(vec_train,train_svm_roc$auc)
+vec_test <- rbind(vec_test,test_svm_roc$auc)
+
+#Random Forest
+tgrid <- expand.grid(
+  .mtry = 6,
+  .splitrule = "gini",
+  .min.node.size = 2
+) 
+set.seed(987654321)
+rf_gridsearch <- train(stroke ~ ., 
+                       data = df_smote,
+                       method = 'ranger',
+                       metric = 'ROC',
+                       tuneGrid = tgrid,
+                       trControl = ctrl_cv5x3)
+
+train_rf= predict(rf_gridsearch,type = "prob")
+train_rf_roc = roc(df_smote$stroke ~ train_rf[,2], plot = FALSE, print.auc = FALSE)
+test_rf = predict(rf_gridsearch,df_test,type = "prob")
+test_rf_roc = roc(df_test$stroke ~ test_rf[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(rf_gridsearch$resample$ROC))
+vec_train <- rbind(vec_train,train_rf_roc$auc)
+vec_test <- rbind(vec_test,test_rf_roc$auc)
+
+#linear discriminant analysis
+set.seed(987654321)
+lda_model <- train(stroke ~ ., 
+        data = df_smote,
+        method = "lda",
+        family = "binomial",
+        trControl = ctrl_cv5x3,
+        metric='ROC')
+
+train_lda= predict(lda_model,type = "prob")
+train_lda_roc = roc(df_smote$stroke ~ train_lda[,2], plot = FALSE, print.auc = FALSE)
+test_lda = predict(lda_model,df_test,type = "prob")
+test_lda_roc = roc(df_test$stroke ~ test_lda[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(lda_model$resample$ROC))
+vec_train <- rbind(vec_train,train_lda_roc$auc)
+vec_test <- rbind(vec_test,test_lda_roc$auc)
+
+#Extreme Gradient Boosting
+set.seed(987654321)
+tune_grid <- expand.grid(nrounds = 200,
+                        max_depth = 4,
+                        eta = 0.05,
+                        gamma = 0,
+                        colsample_bytree = 0.5,
+                        min_child_weight = 0,
+                        subsample = 0.5)
+
+xgb_fit <- train(stroke ~., data = df_smote, method = "xgbTree",
+                trControl=ctrl_cv5x3,
+                tuneGrid = tune_grid,
+                tuneLength = 10,
+                metric='ROC')
+train_xgb= predict(xgb_fit,type = "prob")
+train_xgb_roc = roc(df_smote$stroke ~ train_xgb[,2], plot = FALSE, print.auc = FALSE)
+test_xgb = predict(xgb_fit,df_test,type = "prob")
+test_xgb_roc = roc(df_test$stroke ~ test_xgb[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(xgb_fit$resample$ROC))
+vec_train <- rbind(vec_train,train_xgb_roc$auc)
+vec_test <- rbind(vec_test,test_xgb_roc$auc)
+
+#Neural Network
+set.seed(987654321)
+nnet_fit <- train(stroke ~., data = df_smote, method = "nnet",
+                trControl=ctrl_cv5x3,
+                 maxit=3000,
+                preProcess = c('center', 'scale'),
+                metric='ROC', 
+                trace=FALSE,
+                tuneGrid=expand.grid(size=1, decay=c(0.1,0.5,1,5)))
+train_nn= predict(nnet_fit,type = "prob")
+train_nn_roc = roc(df_smote$stroke ~ train_nn[,2], plot = FALSE, print.auc = FALSE)
+test_nn = predict(nnet_fit,df_test,type = "prob")
+test_nn_roc = roc(df_test$stroke ~ test_nn[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(nnet_fit$resample$ROC))
+vec_train <- rbind(vec_train,train_nn_roc$auc)
+vec_test <- rbind(vec_test,test_nn_roc$auc)
+
+#Elastic Net
+set.seed(987654321)
+parameters_elastic2 <- expand.grid(alpha = 0.1, 
+                                   lambda = 0.01)
+
+glm_fit <- train(stroke ~., data = df_smote, method = "glmnet",
+                trControl=ctrl_cv5x3,
+                metric='ROC',
+                tuneGrid = parameters_elastic2
+                )
+train_glm= predict(glm_fit,type = "prob")
+train_glm_roc = roc(df_smote$stroke ~ train_glm[,2], plot = FALSE, print.auc = FALSE)
+test_glm = predict(glm_fit,df_test,type = "prob")
+test_glm_roc = roc(df_test$stroke ~ test_glm[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(glm_fit$resample$ROC))
+vec_train <- rbind(vec_train,train_glm_roc$auc)
+vec_test <- rbind(vec_test,test_glm_roc$auc)
+
+#Adaboost
+set.seed(987654321)
+Grid <- expand.grid(maxdepth=5,nu=0.1,iter=150)
+ada_fit = train(x=df_smote[,-11],y=df_smote[,11], method="ada",
+                    trControl = ctrl_cv5x3,metric='ROC',
+                    tuneGrid=Grid)
+train_ada= predict(ada_fit,type = "prob")
+train_ada_roc = roc(df_smote$stroke ~ train_ada[,2], plot = FALSE, print.auc = FALSE)
+test_ada = predict(ada_fit,df_test,type = "prob")
+test_ada_roc = roc(df_test$stroke ~ test_ada[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(ada_fit$resample$ROC))
+vec_train <- rbind(vec_train,train_ada_roc$auc)
+vec_test <- rbind(vec_test,test_ada_roc$auc)
+
+#Gradient Boosting
+set.seed(987654321)
+gbm_fit <- train(stroke ~ ., data = df_smote, 
+                 method = "gbm",
+                 metric='ROC',
+                 trControl = ctrl_cv5x3,
+                 
+                 verbose = FALSE)
+train_gbm= predict(gbm_fit,type = "prob")
+train_gbm_roc = roc(df_smote$stroke ~ train_gbm[,2], plot = FALSE, print.auc = FALSE)
+test_gbm = predict(gbm_fit,df_test,type = "prob")
+test_gbm_roc = roc(df_test$stroke ~ test_gbm[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(gbm_fit$resample$ROC))
+vec_train <- rbind(vec_train,train_gbm_roc$auc)
+vec_test <- rbind(vec_test,test_gbm_roc$auc)
+
+#Regularized discriminant analysis
+set.seed(987654321)
+rdaGrid = expand.grid(gamma = (0:4)/4, lambda = c(0.5,3/4,1))
+
+rda_fit <- train(stroke ~ ., data = df_smote, 
+                 method = "rda",
+                 metric='ROC',
+                 trControl = ctrl_cv5x3,
+                 tuneGrid  = rdaGrid)
+train_rda= predict(rda_fit,type = "prob")
+train_rda_roc = roc(df_smote$stroke ~ train_rda[,2], plot = FALSE, print.auc = FALSE)
+test_rda = predict(rda_fit,df_test,type = "prob")
+test_rda_roc = roc(df_test$stroke ~ test_rda[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(rda_fit$resample$ROC))
+vec_train <- rbind(vec_train,train_rda_roc$auc)
+vec_test <- rbind(vec_test,test_rda_roc$auc)
+
+#Partial Least Squared
+set.seed(987654321)
+pls_fit <- train(stroke ~ ., data = df_smote, 
+                 method = "pls",
+                 metric='ROC',
+                 preProc = c("center", "scale"),
+                 tuneLength = 10,
+                 maxit=1000,
+                 trControl = ctrl_cv5x3
+                 )
+train_pls= predict(pls_fit,type = "prob")
+train_pls_roc = roc(df_smote$stroke ~ train_pls[,2], plot = FALSE, print.auc = FALSE)
+test_pls = predict(pls_fit,df_test,type = "prob")
+test_pls_roc = roc(df_test$stroke ~ test_pls[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(pls_fit$resample$ROC))
+vec_train <- rbind(vec_train,train_pls_roc$auc)
+vec_test <- rbind(vec_test,test_pls_roc$auc)
+```
+
+After all models are trained we are going to create matrix of results.
+```{r}
+#column binding train prediction,cross-validation and test prediction results
+df_results <- cbind(vec_train,vec_valid,vec_test)
+#changing rownames
+rownames(df_results) <- c('logit','knn','svm','rf','lda', 'xgb','nnet','elastic',
+                          'ada','gbm','rda','pls')
+#changing colnames
+colnames(df_results) <- c('train','cross_validation','test')
+
+```
+
+On the plot below we can see cross-validation results. Firstly we can spot that KNN is the worst model, AUCROC is only equal to 0.84 and lag behind others. Next we have group of models that have very similar performance. In this group there is SVM, logit, pls, lda and even some simple neural network. Their AUCROC is between 0.875-0.876. The best methods turned out to be tree based models. Their AUCROC performance is between 0.894 and 0.905. Although, they can be easily over fitted.
+
+```{r}
+#storing list of resamples to make dotplot of cross-validation AUCROC results 
+cvValues <- resamples(list(ada = ada_fit, elastic = glm_fit,nn=nnet_fit,
+                           xgb=xgb_fit,svm=svm_model,knn=knn_model,
+                           lda=lda_model,logit=log_model,rf=rf_gridsearch,
+                           gbm=gbm_fit,rda=rda_fit,pls=pls_fit))
+#ploting results of models cross-validation results
+dotplot(cvValues, metric = "ROC", main = 'Cross-validation results')
+```
+
+Now let`s check how the models predict out of sample data. As, we can see in the table all the models have lower performance on test data. KNN is still the worst. Test AUCROC for tree models dropped significantly by more or less 0.06. Their test performance is worse than those algorithms in the middle like logit, lda or pls. This indicates that tree based model over fitted the data. There might me many reasons for that. For example, they spotted some non-linearities that actually were not true. Another thing is that after using SMOTE, data sample was small and they could produce biased estimate. Knowing that there exist bias-variance trade off, on test data they did way worse. The best models on test data were Partial Least Square and Linear Discriminant Analysis. Their AUCROC was equal to 0.863.
+
+```{r}
+#printing table of train/cross-validation/test results
+df_results %>% as.data.frame() %>% arrange(desc(cross_validation)) %>%
+  kableExtra::kbl(digits = 3,caption = 'AUCROC') %>%
+  kableExtra::kable_classic("striped", full_width = F)
+```
+
+# Summary
+
+To sum up, we could see that even though the data was simple and small, there were many obstacles and coming to conclusion which model is the best is not clear. To help us better understand why tree base models over fitted the data, we could use XAI(explainable artificial intelligence). When it comes to results, cross-validation clearly state that Random Forest is the best but there is dropdown in test performance in comparison to simpler methods like lda or logit. If we would have to choose the best model for this data we would choose logit. It is very fast, simple and interpretable approach that still got pretty nice performance.
